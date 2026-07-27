@@ -1,0 +1,10 @@
+.gradle/
+**/build/
+.idea/
+*.iml
+out/
+
+# Local credentials and caches
+.env
+*.local
+dynamic-sprites-cache/
