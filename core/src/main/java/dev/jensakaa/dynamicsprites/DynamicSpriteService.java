@@ -375,7 +375,11 @@ public final class DynamicSpriteService implements AutoCloseable {
     } catch (IOException exception) {
       throw new SpriteException(assetId, "cache read failed for tile " + tileHash, true, null, exception);
     }
-    return inFlight.computeIfAbsent(tileHash, ignored ->
+    CompletableFuture<TextureProperty> pending = new CompletableFuture<>();
+    CompletableFuture<TextureProperty> existing = inFlight.putIfAbsent(tileHash, pending);
+    if (existing != null) return existing;
+
+    try {
       uploadProvider.upload(assetId, tileHash, png, token)
         .thenApply(property -> {
           try {
@@ -392,9 +396,19 @@ public final class DynamicSpriteService implements AutoCloseable {
           memoryCache.put(tileHash, property);
           return property;
         })
-        .whenComplete((result, error) -> inFlight.remove(tileHash))
-        .toCompletableFuture()
-    );
+        .whenComplete((result, error) -> {
+          inFlight.remove(tileHash, pending);
+          if (error == null) {
+            pending.complete(result);
+          } else {
+            pending.completeExceptionally(error);
+          }
+        });
+    } catch (RuntimeException exception) {
+      inFlight.remove(tileHash, pending);
+      pending.completeExceptionally(exception);
+    }
+    return pending;
   }
 
   private List<DynamicSpriteFrame> coalesceFrames(

@@ -1,62 +1,72 @@
 # Dynamic Sprites
 
-`dynamic-sprites` подготавливает новые изображения во время работы сервера и показывает их через
-обычные Minecraft `player`-components. Перезагрузка ресурспака для нового изображения не нужна:
-клиент получает подписанную ссылку `textures.minecraft.net` и кеширует текстуру как скин.
+`dynamic-sprites` подготавливает изображения во время работы Minecraft-сервера и показывает их через обычные Adventure `player`-components. Для нового изображения не требуется перезагрузка ресурспака: клиент получает подписанную текстуру `textures.minecraft.net` и кеширует её как скин.
 
-Система подходит для HUD, текста, портретов, карточек и небольших анимаций. Она не заменяет
-ресурспак для больших статичных интерфейсов: каждый фрагмент изображения остаётся отдельным
-текстовым компонентом.
+Библиотека подходит для HUD, текста, портретов, карточек и небольших анимаций. Большие статические интерфейсы выгоднее хранить в ресурспаке: каждый фрагмент динамического изображения остаётся отдельным текстовым компонентом.
 
-## Подключение
+## Модули
 
-При размещении библиотеки рядом с проектом подключить её как Gradle composite:
+- `core` — чтение PNG/GIF/APNG, resize, разбиение на фрагменты, кеш и абстракции загрузки текстур;
+- `mineskin` — реализация `TextureUploadProvider` через MineSkin V2 queue;
+- `paper` — Adventure renderer и интеграция со SkinsRestorer;
+- `resourcepack` — Java/GLSL-константы shader marker.
+
+## Подключение как зависимости
+
+Релизные теги доступны через JitPack, поэтому потребителю не нужно клонировать репозиторий или добавлять composite build.
 
 ```kotlin
-includeBuild("../dynamic-sprites")
+repositories {
+  maven("https://jitpack.io")
+}
+
+dependencies {
+  implementation("com.github.MakarME.dynamic-sprites:core:<version>")
+  implementation("com.github.MakarME.dynamic-sprites:mineskin:<version>")
+  implementation("com.github.MakarME.dynamic-sprites:paper:<version>")
+  implementation("com.github.MakarME.dynamic-sprites:resourcepack:<version>")
+}
 ```
 
-Внутри находятся четыре модуля:
+Вместо `<version>` укажите Git tag, например `v1.0.0`. Подключайте только нужные модули; `mineskin`, `paper` и `resourcepack` уже экспортируют зависимость на `core`.
 
-- `core` — PNG, resize, разбиение на фрагменты, GIF/APNG и кеш;
-- `mineskin` — загрузка фрагментов через MineSkin V2 queue;
-- `paper` — Adventure components, inline renderer и поддержка SkinsRestorer;
-- `resourcepack` — единые Java/GLSL-константы для shader marker `R=4`.
+Для локальной разработки все модули публикуются в Maven Local вместе с source и Javadoc JAR:
 
-Для другого проекта достаточно подключить необходимые зависимости
-`dev.jensakaa.dynamic-sprites:core`, `mineskin` и `paper` через тот же composite build.
-
-## Настройка MineSkin
-
-Создать API key в MineSkin и передать его серверу:
-
-```text
-DYNAMIC_SPRITES_MINESKIN_API_KEY=msk_...
+```shell
+./gradlew publishToMavenLocal -Pversion=1.0.0-local
 ```
 
-Ключ не хранится в Git и не попадает в HUD Editor. Без ключа уже закешированные изображения
-продолжают работать, но подготовка новых фрагментов завершается понятной ошибкой.
+Локальные координаты имеют вид `dev.jensakaa.dynamic-sprites:<module>:<version>`.
 
-Основные настройки находятся в `config.yml`:
+## Создание сервиса
 
-```yaml
-dynamic-sprites:
-  cache-directory: dynamic-sprites-cache
-  mineskin:
-    concurrency: 2
-    maximum-retries: 5
-  limits:
-    visible-tiles: 64
-    animation-frames: 60
-    animation-unique-tiles: 128
-    source-mib: 20
-    decoded-megapixels: 16
-    disk-payload-mib: 256
+Библиотека не читает конфигурацию конкретного плагина и не содержит глобального singleton. Владелец приложения создаёт сервис явно и закрывает его при выключении:
+
+```java
+String apiKey = System.getenv("DYNAMIC_SPRITES_MINESKIN_API_KEY");
+
+MineSkinV2Provider uploader = new MineSkinV2Provider(
+  MineSkinV2Settings.defaults(apiKey, "my-plugin/1.0")
+);
+ContentAddressedDiskSpriteCacheStore cache =
+  new ContentAddressedDiskSpriteCacheStore(
+    Path.of("plugins/my-plugin/dynamic-sprites-cache"),
+    SpriteLimits.DEFAULTS.maximumDiskPayloadBytes()
+  );
+
+DynamicSpriteService sprites = new DynamicSpriteService(
+  uploader,
+  cache,
+  null, // Передайте PlayerSkinResolver, если нужны SpriteSource.PlayerSkin.
+  SpriteLimits.DEFAULTS
+);
 ```
 
-## Подготовка PNG
+При выключении вызовите `sprites.close()` и `uploader.close()`. API key не следует хранить в Git.
 
-Подготовка всегда асинхронная. Не следует ожидать результат через `join()` на тике сервера.
+## Подготовка и показ PNG
+
+Подготовка всегда асинхронная. Не ожидайте результат через `join()` на серверном тике.
 
 ```java
 SpriteRequest request = new SpriteRequest(
@@ -68,40 +78,22 @@ SpriteRequest request = new SpriteRequest(
   SpriteRenderMode.LOSSLESS_RGBA_TILE
 );
 
-SpritePreparation<DynamicSpriteAsset> preparation =
-  DynamicSprites.service().prepare(request);
+SpritePreparation<DynamicSpriteAsset> preparation = sprites.prepare(request);
 
 preparation.completion().thenAccept(asset -> {
   player.getScheduler().run(plugin, task -> {
-    Component component = HudDynamicSpriteRenderer.inlineRenderer()
-      .inline(asset, 0, SpritePixelSpace.GUI);
+    DynamicSpriteRenderer renderer = new DynamicSpriteRenderer(spacingProvider);
+    Component component = renderer.inline(asset, 0, SpritePixelSpace.GUI);
     player.sendMessage(component);
   }, null);
 });
 ```
 
-`SpriteSource` также принимает bytes, `BufferedImage`, URL, готовое texture property и skin
-игрока. URL предназначен только для доверенного серверного кода; локальные и private-адреса
-блокируются.
+`spacingProvider` — реализация `PixelSpacingProvider` из ресурспака потребителя. `SpriteSource` также принимает bytes, `BufferedImage`, URL, готовое texture property и скин игрока. URL предназначен только для доверенного серверного кода; локальные и private-адреса блокируются.
 
-## Показ В HUD
+Для HUD без сохранения text advance используйте `DynamicSpriteRenderer.hud(...)` или получите независимые `DynamicSpriteNode` через `nodes(...)`.
 
-Для Actionbar/Bossbar используется zero-advance узел. Он не двигает соседние элементы:
-
-```java
-HudNode node = HudDynamicSpriteRenderer.node(
-  hudElement,
-  asset,
-  x,
-  y,
-  SpritePixelSpace.PHYSICAL
-);
-```
-
-`x`, `y`, видимость, кадр и порядок можно менять отдельно для каждого игрока. Сам asset
-неизменяемый и может безопасно переиспользоваться между игроками.
-
-Для GIF/APNG:
+## GIF и APNG
 
 ```java
 AnimationRequest request = new AnimationRequest(
@@ -112,9 +104,8 @@ AnimationRequest request = new AnimationRequest(
   ResizeMode.FIT
 );
 
-DynamicSprites.service().prepareAnimation(request).completion().thenAccept(animation -> {
-  HudNode node = HudDynamicSpriteRenderer.node(
-    hudElement,
+sprites.prepareAnimation(request).completion().thenAccept(animation -> {
+  Component frame = renderer.hud(
     animation,
     elapsedTicks,
     x,
@@ -124,68 +115,26 @@ DynamicSprites.service().prepareAnimation(request).completion().thenAccept(anima
 });
 ```
 
-Анимация появляется только после подготовки всех уникальных фрагментов. До этого следует
-показывать обычный placeholder.
+Анимация становится доступна только после подготовки всех уникальных фрагментов. До завершения можно показывать обычный placeholder.
 
-## Как Считается Стоимость
+## Ограничения и кеш
 
-- Непрозрачный фрагмент вмещает `64x64` пикселей.
-- Фрагмент с любой прозрачностью вмещает `64x32` пикселей без потери RGBA.
-- Полностью прозрачные фрагменты пропускаются.
-- Одинаковые фрагменты и одинаковые кадры переиспользуются.
-- Один кадр по умолчанию ограничен 64 видимыми фрагментами.
-- Анимация ограничена 60 кадрами и 128 уникальными фрагментами.
+По умолчанию:
 
-Например, полностью непрозрачная картинка `1024x1024` требует 256 компонентов и не проходит
-стандартный лимит. Такой фон дешевле запечь в ресурспак. Динамические спрайты лучше использовать
-для небольших изображений, портретов и меняющегося содержимого.
+- непрозрачный фрагмент вмещает `64x64` пикселей;
+- RGBA-фрагмент вмещает `64x32` пикселей без потери прозрачности;
+- полностью прозрачные и одинаковые фрагменты переиспользуются;
+- один кадр ограничен 64 видимыми фрагментами;
+- анимация ограничена 60 кадрами и 128 уникальными фрагментами.
 
-## Кеш
+Ключ кеша зависит от нормализованных RGBA-пикселей, размера, resize mode и версии encoder. Перед MineSkin проверяются memory cache и content-addressed disk cache, а одновременные запросы одного фрагмента объединяются.
 
-Ключ строится из нормализованных RGBA-пикселей, размера, resize mode и версии encoder. Перед
-MineSkin проверяются:
+## Shader hook
 
-1. ограниченный memory cache;
-2. content-addressed disk cache;
-3. MineSkin V2 queue.
+`R=4` зарезервирован библиотекой для dynamic sprite. В `G+B` кодируются signed Y, render mode, GUI/physical pixel space и signature. GLSL-константы генерируются вызовом `DynamicSpriteShaderInclude.glslDefines()` и используют нейтральный префикс `DYNAMIC_SPRITE_*`.
 
-Одновременные запросы одного фрагмента объединяются в один `CompletableFuture`. Texture property
-не протухает автоматически. При заполнении disk budget удаляются только старые encoded PNG;
-маленькие property manifests сохраняются, поэтому повторная загрузка через MineSkin не нужна.
+Режимы рендера: `OPAQUE_TILE`, `LOSSLESS_RGBA_TILE`, `FLAT_HEAD` и `ISOMETRIC_HEAD`.
 
-Minecraft кеширует `textures.minecraft.net` между сессиями в клиентском skin cache. Протокол не
-сообщает серверу, успел ли клиент скачать текстуру, поэтому preloader остаётся best-effort.
+## Лицензия
 
-## HUD Editor
-
-В Asset Browser выбрать `Runtime`, затем импортировать PNG, GIF или APNG. Файл сохраняется в
-`resourcepack/hud/dynamic-samples/` только как preview-образец.
-
-Анализ выполняется в Web Worker и не блокирует canvas. В свойствах элемента показываются:
-
-- число кадров;
-- максимум видимых фрагментов на кадр;
-- число уникальных фрагментов;
-- длительность и предупреждения о лимитах.
-
-После визуальной подгонки сохранить layout. Код реализации решает, какой реальный asset показать,
-а editor хранит только геометрию и preview.
-
-## Shader Hook
-
-`R=4` зарезервирован для dynamic sprite. В `G+B` находятся signed Y, render mode,
-GUI/physical pixel space и signature. Константы Java и GLSL генерируются из одного
-`DynamicSpriteEncoding`; при конфликте с `R=1..3` сборка останавливается.
-
-Режимы:
-
-- `OPAQUE_TILE`;
-- `LOSSLESS_RGBA_TILE`;
-- `FLAT_HEAD`;
-- `ISOMETRIC_HEAD`.
-
-Изометрическая голова собирается шейдером из обычной `64x64` skin texture. Отдельный PNG для неё
-MineSkin не создаёт.
-
-Официальная документация: [MineSkin queue](https://docs.mineskin.org/docs/mineskin-api/queue-skin-generation/)
-и [rate limits](https://docs.mineskin.org/docs/guides/rate-limits/).
+Проект распространяется на условиях [GNU General Public License v3.0 only](LICENSE).
